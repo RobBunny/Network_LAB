@@ -1,0 +1,101 @@
+import java.io.*;
+import java.net.*;
+import java.util.UUID;
+
+public class ATMClient {
+    private final String host;
+    private final int port;
+    private DataInputStream in;
+    private DataOutputStream out;
+    private Socket socket;
+
+    public ATMClient(String host, int port) {
+        this.host = host; this.port = port;
+    }
+
+    public void connect() throws IOException {
+        socket = new Socket(host, port);
+        in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
+        out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
+        System.out.println("Connected to bank");
+    }
+
+    public void close() {
+        try { if (socket != null) socket.close(); } catch (IOException ignored) {}
+    }
+
+    private String sendWithRetryExpectResponse(String request, String expectPrefix, String txnId) throws IOException {
+        int maxRetries = 5;
+        int attempt = 0;
+        long backoffMs = 300;
+
+        while (attempt < maxRetries) {
+            out.writeUTF(request);
+            out.flush();
+
+            long deadline = System.currentTimeMillis() + backoffMs;
+            while (System.currentTimeMillis() < deadline) {
+                if (in.available() > 0) {
+                    String resp = in.readUTF();
+                    if (resp.startsWith(expectPrefix) && resp.contains("|" + txnId)) {
+                        // Send ACK and return
+                        out.writeUTF("ACK|" + txnId);
+                        out.flush();
+                        return resp;
+                    } else {
+                        // Unexpected; ignore or handle
+                    }
+                } else {
+                    try { Thread.sleep(25); } catch (InterruptedException ignored) {}
+                }
+            }
+            attempt++;
+            backoffMs = Math.min(backoffMs * 2, 3000);
+            // Retry with the exact same request (same txn_id) to ensure dedupe
+        }
+        throw new IOException("Timeout waiting for response for txn " + txnId);
+    }
+
+    public boolean auth(String cardNo, String pin) throws IOException {
+        String txnId = UUID.randomUUID().toString();
+        String req = "AUTH|" + txnId + "|" + cardNo + "|" + pin;
+        String resp = sendWithRetryExpectResponse(req, "AUTH_", txnId);
+        System.out.println("AUTH resp: " + resp);
+        return resp.startsWith("AUTH_OK|");
+    }
+
+    public String withdraw(String accountId, String amountDollarsCents) throws IOException {
+        String txnId = UUID.randomUUID().toString();
+        String req = "WITHDRAW|" + txnId + "|" + accountId + "|" + amountDollarsCents;
+        String resp = sendWithRetryExpectResponse(req, "WITHDRAW_", txnId);
+        System.out.println("WITHDRAW resp: " + resp);
+        return resp;
+    }
+
+    public static void main(String[] args) throws Exception {
+        ATMClient c = new ATMClient("127.0.0.1", 5000);
+        try {
+            c.connect();
+
+            // 1) AUTH
+            boolean ok = c.auth("card-001", "1234");
+            if (!ok) {
+                System.out.println("Auth failed");
+                return;
+            }
+            // 2) WITHDRAW success
+            String r1 = c.withdraw("acct-123", "100.00"); // should go to 900.00
+            // 3) WITHDRAW insufficient funds
+            String r2 = c.withdraw("acct-456", "500.00");
+
+            // 4) Demonstrate exactly-once: resend same txn_id by manual call (for demo)
+            // In practice, retries reuse the same txn_id automatically in sendWithRetry.
+            // Here we simulate by calling withdraw() but keeping same txn_id would require exposing a method;
+            // the server-side logic ensures duplicates return cached outcome.
+
+            System.out.println("Done: " + r1 + " | " + r2);
+        } finally {
+            c.close();
+        }
+    }
+}

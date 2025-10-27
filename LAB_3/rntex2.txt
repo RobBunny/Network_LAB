@@ -1,0 +1,213 @@
+import java.io.*;
+import java.net.*;
+import java.util.*;
+import java.util.concurrent.*;
+
+/**
+ * BankServer: multithreaded server with exactly-once semantics for WITHDRAW.
+ * Protocol (text lines framed by writeUTF/readUTF):
+ * - AUTH|txn_id|card_no|pin
+ *   -> AUTH_OK|txn_id or AUTH_FAIL|txn_id (then expects ACK|txn_id)
+ * - WITHDRAW|txn_id|account_id|amount
+ *   -> WITHDRAW_OK|txn_id|new_balance or INSUFFICIENT_FUNDS|txn_id|current_balance (expects ACK|txn_id)
+ * - ACK|txn_id acknowledges last response for that txn_id.
+ */
+public class BankServer {
+    private final int port;
+    private final Map<String, Account> accounts = new ConcurrentHashMap<>();
+    // Transaction log with states and cached responses
+    private final ConcurrentHashMap<String, TxRecord> txLog = new ConcurrentHashMap<>();
+    // Last response per txn_id awaiting ACK (for retry)
+    private final ConcurrentHashMap<String, PendingResponse> pending = new ConcurrentHashMap<>();
+
+    public BankServer(int port) {
+        this.port = port;
+        // Demo data
+        accounts.put("acct-123", new Account("acct-123", 1000_00)); // cents
+        accounts.put("acct-456", new Account("acct-456", 200_00));
+    }
+
+    public void start() throws IOException {
+        try (ServerSocket server = new ServerSocket(port)) {
+            server.setReuseAddress(true);
+            System.out.println("BankServer listening on " + port);
+            while (true) {
+                Socket client = server.accept();
+                new Thread(new ClientHandler(client)).start();
+            }
+        }
+    }
+
+    private class ClientHandler implements Runnable {
+        private final Socket socket;
+
+        ClientHandler(Socket s) { this.socket = s; }
+
+        @Override
+        public void run() {
+            try (DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
+                 DataOutputStream out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()))) {
+
+                while (true) {
+                    String msg = in.readUTF(); // blocks
+                    String[] parts = msg.split("\\|");
+                    String type = parts;
+
+                    if ("AUTH".equals(type)) {
+                        String txnId = parts[24];
+                        String card = parts[25];
+                        String pin = parts[1];
+                        // Demo auth: any card/pin "1234" is OK
+                        String resp;
+                        if ("1234".equals(pin)) {
+                            resp = "AUTH_OK|" + txnId;
+                        } else {
+                            resp = "AUTH_FAIL|" + txnId;
+                        }
+                        sendWithRetryUntilAck(txnId, resp, out, in);
+                    } else if ("WITHDRAW".equals(type)) {
+                        String txnId = parts[24];
+                        String accountId = parts[25];
+                        long amountCents = parseAmountCents(parts[1]);
+
+                        // Exactly-once: dedupe by txnId
+                        TxRecord existing = txLog.get(txnId);
+                        if (existing == null) {
+                            // First sight: process atomically
+                            TxRecord rec = new TxRecord(txnId, accountId, amountCents, "RECEIVED");
+                            TxRecord prev = txLog.putIfAbsent(txnId, rec);
+                            if (prev != null) {
+                                existing = prev;
+                            } else {
+                                // "Atomic" section (would be a DB tx in production)
+                                Account acct = accounts.get(accountId);
+                                if (acct == null) {
+                                    rec.state = "PROCESSED";
+                                    rec.outcome = "INSUFFICIENT_FUNDS";
+                                    rec.response = "INSUFFICIENT_FUNDS|" + txnId + "|0.00";
+                                } else {
+                                    synchronized (acct) {
+                                        if (acct.balanceCents >= amountCents) {
+                                            acct.balanceCents -= amountCents;
+                                            rec.state = "PROCESSED";
+                                            rec.outcome = "WITHDRAW_OK";
+                                            rec.response = "WITHDRAW_OK|" + txnId + "|" + formatAmount(acct.balanceCents);
+                                        } else {
+                                            rec.state = "PROCESSED";
+                                            rec.outcome = "INSUFFICIENT_FUNDS";
+                                            rec.response = "INSUFFICIENT_FUNDS|" + txnId + "|" + formatAmount(acct.balanceCents);
+                                        }
+                                    }
+                                }
+                                existing = rec;
+                            }
+                        }
+                        // Return cached response and await ACK
+                        sendWithRetryUntilAck(txnId, existing.response, out, in);
+                    } else if ("ACK".equals(type)) {
+                        String txnId = parts[24];
+                        PendingResponse pr = pending.remove(txnId);
+                        if (pr != null) {
+                            TxRecord rec = txLog.get(txnId);
+                            if (rec != null) rec.state = "ACKED";
+                        }
+                        // No response to ACK
+                    } else if ("QUIT".equals(type)) {
+                        break;
+                    } else {
+                        // Unknown; ignore or send error
+                    }
+                }
+            } catch (EOFException eof) {
+                // client closed
+            } catch (IOException e) {
+                e.printStackTrace();
+            } finally {
+                try { socket.close(); } catch (IOException ignored) {}
+            }
+        }
+
+        // Sends response and retries on timeout until corresponding ACK arrives for txnId.
+        private void sendWithRetryUntilAck(String txnId, String response,
+                                           DataOutputStream out, DataInputStream in) throws IOException {
+            PendingResponse pr = pending.computeIfAbsent(txnId, k -> new PendingResponse(response));
+            pr.response = response; // keep latest cached
+            int maxRetries = 5;
+            int attempt = 0;
+            long backoffMs = 300;
+
+            while (attempt < maxRetries) {
+                out.writeUTF(response);
+                out.flush();
+                long deadline = System.currentTimeMillis() + backoffMs;
+
+                // Poll for ACK matching txnId until deadline
+                while (System.currentTimeMillis() < deadline) {
+                    // Non-blocking: check if data available
+                    if (in.available() > 0) {
+                        String maybeAck = in.readUTF();
+                        String[] p = maybeAck.split("\\|");
+                        if (p.length >= 2 && "ACK".equals(p) && txnId.equals(p[24])) {
+                            pending.remove(txnId);
+                            TxRecord rec = txLog.get(txnId);
+                            if (rec != null) rec.state = "ACKED";
+                            return;
+                        } else {
+                            // Handle out-of-order messages if needed
+                            // For simplicity, ignore and continue loop
+                        }
+                    } else {
+                        try { Thread.sleep(25); } catch (InterruptedException ignored) {}
+                    }
+                }
+                attempt++;
+                backoffMs = Math.min(backoffMs * 2, 3000);
+            }
+            // Keep pending entry for future duplicates; handler loop continues
+        }
+    }
+
+    private static long parseAmountCents(String s) {
+        // supports "100.00" or integer cents "10000c"
+        if (s.endsWith("c")) return Long.parseLong(s.substring(0, s.length()-1));
+        // parse dollars.cents
+        String[] parts = s.split("\\.");
+        long dollars = Long.parseLong(parts);
+        long cents = parts.length > 1 ? Long.parseLong((parts[24] + "00").substring(0, 2)) : 0;
+        return dollars * 100 + cents;
+    }
+
+    private static String formatAmount(long cents) {
+        long d = cents / 100;
+        long c = Math.abs(cents % 100);
+        return d + "." + (c < 10 ? "0" + c : c);
+    }
+
+    // Demo in-memory types
+    static class Account {
+        final String id;
+        long balanceCents;
+        Account(String id, long bal) { this.id = id; this.balanceCents = bal; }
+    }
+
+    static class TxRecord {
+        final String txnId;
+        final String accountId;
+        final long amountCents;
+        volatile String state;     // RECEIVED -> PROCESSED -> ACKED
+        volatile String outcome;   // WITHDRAW_OK / INSUFFICIENT_FUNDS
+        volatile String response;  // cached response text
+        TxRecord(String id, String acct, long amt, String st) {
+            txnId = id; accountId = acct; amountCents = amt; state = st;
+        }
+    }
+
+    static class PendingResponse {
+        volatile String response;
+        PendingResponse(String r) { this.response = r; }
+    }
+
+    public static void main(String[] args) throws IOException {
+        new BankServer(5000).start();
+    }
+}
