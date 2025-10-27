@@ -1,0 +1,225 @@
+import java.io.*;
+import java.net.*;
+import java.util.*;
+import java.nio.file.*;
+
+class ClientHandler extends Thread {
+    Socket socket;
+    DataInputStream dis;
+    DataOutputStream dos;
+
+    ClientHandler(Socket socket, DataInputStream dis, DataOutputStream dos) {
+        this.socket = socket;
+        this.dis = dis;
+        this.dos = dos;
+    }
+
+    @Override
+    public void run() {
+        try {
+            while (true) {
+                dos.writeUTF("Enter command: AUTH:<card_no>:<pin> / EXIT");
+                String received = dis.readUTF();
+                if (received.equalsIgnoreCase("EXIT")) {
+                    System.out.println("Client disconnected: " + socket.getPort());
+                    socket.close();
+                    break;
+                }
+
+                if (received.startsWith("AUTH:")) {
+                    String[] parts = received.split(":");
+                    String cardNo = parts[1];
+                    String pin = parts[2];
+                    int balance = authenticate(cardNo, pin);
+                    if (balance >= 0) {
+                        dos.writeUTF("AUTH_OK");
+                        handleTransactions(cardNo);
+                    } else {
+                        dos.writeUTF("AUTH_FAIL");
+                    }
+                } else {
+                    dos.writeUTF("Invalid command!");
+                }
+            }
+            dis.close();
+            dos.close();
+        } catch (IOException e) {
+            System.out.println("Connection closed with client: " + socket.getPort());
+        }
+    }
+
+    int authenticate(String cardNo, String pin) {
+        try {
+            List<String> lines = Files.readAllLines(Paths.get("rntex3.txt"));
+            for (String line : lines) {
+                if (line.startsWith("#") || line.trim().isEmpty())
+                    continue;
+                String[] parts = line.split(":");
+                if (parts[0].equals(cardNo) && parts[1].equals(pin)) {
+                    return Integer.parseInt(parts[2]);
+                }
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        return -1;
+    }
+
+    synchronized void handleTransactions(String cardNo) throws IOException {
+        while (true) {
+            dos.writeUTF("Enter command: BALANCE / WITHDRAW:<amount> / ADD:<amount> / EXIT");
+            String command = dis.readUTF();
+            if (command.equalsIgnoreCase("EXIT")) {
+                dos.writeUTF("Session ended.");
+                break;
+            }
+            if (command.equalsIgnoreCase("BALANCE")) {
+                int balance = getBalance(cardNo);
+                dos.writeUTF("Current Balance: " + balance);
+            } else if (command.startsWith("WITHDRAW:")) {
+                int amount = Integer.parseInt(command.split(":")[1]);
+                processWithdraw(cardNo, amount);
+            } else if (command.startsWith("ADD:")) {
+                int amount = Integer.parseInt(command.split(":")[1]);
+                processAdd(cardNo, amount);
+            } else {
+                dos.writeUTF("Invalid command!");
+            }
+        }
+    }
+
+    int getBalance(String cardNo) throws IOException {
+        List<String> lines = Files.readAllLines(Paths.get("bank_database.txt"));
+        for (String line : lines) {
+            if (line.startsWith("#") || line.trim().isEmpty())
+                continue;
+            String[] parts = line.split(":");
+            if (parts[0].equals(cardNo)) {
+                return Integer.parseInt(parts[2]);
+            }
+        }
+        return 0;
+    }
+
+
+    void processWithdraw(String cardNo, int amount) throws IOException {
+        List<String> lines = Files.readAllLines(Paths.get("bank_database.txt"));
+        for (int i = 0; i < lines.size(); i++) {
+            String line = lines.get(i);
+            if (line.startsWith("#") || line.trim().isEmpty())
+                continue;
+            String[] parts = line.split(":");
+            if (parts[0].equals(cardNo)) {
+                int balance = Integer.parseInt(parts[2]);
+                if (balance >= amount) {
+                    balance -= amount;
+                    lines.set(i, parts[0] + ":" + parts[1] + ":" + balance);
+                    Files.write(Paths.get("bank_database.txt"), lines);
+                    logTransaction(cardNo, "WITHDRAW", amount, balance);
+                    dos.writeUTF("WITHDRAW_OK");
+                } else {
+                    dos.writeUTF("INSUFFICIENT_FUNDS: Current Balance = " + balance);
+                }
+                return;
+            }
+        }
+    }
+
+    void processAdd(String cardNo, int amount) throws IOException {
+        List<String> lines = Files.readAllLines(Paths.get("bank_database.txt"));
+        for (int i = 0; i < lines.size(); i++) {
+            String line = lines.get(i);
+            if (line.startsWith("#") || line.trim().isEmpty())
+                continue;
+            String[] parts = line.split(":");
+            if (parts[0].equals(cardNo)) {
+                int balance = Integer.parseInt(parts[2]);
+                balance += amount;
+                lines.set(i, parts[0] + ":" + parts[1] + ":" + balance);
+                Files.write(Paths.get("bank_database.txt"), lines);
+                logTransaction(cardNo, "ADD", amount, balance);
+                dos.writeUTF("ADD_OK");
+                return;
+            }
+        }
+    }
+
+    void logTransaction(String cardNo, String type, int amount, int newBalance) {
+        try (BufferedWriter bw = new BufferedWriter(new FileWriter("transaction_log.txt", true))) {
+            bw.write(cardNo + ":" + type + ":" + amount + ":" + newBalance);
+            bw.newLine();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+}
+
+public class LAB3_35_39_Server {
+    public static void main(String[] args) {
+        try (ServerSocket serverSocket = new ServerSocket(5000)) {
+            System.out.println("Server started. Waiting for clients...");
+            while (true) {
+                Socket socket = serverSocket.accept();
+                System.out.println("Client connected: " + socket.getPort());
+                DataInputStream dis = new DataInputStream(socket.getInputStream());
+                DataOutputStream dos = new DataOutputStream(socket.getOutputStream());
+                ClientHandler clientHandler = new ClientHandler(socket, dis, dos);
+                clientHandler.start();
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+}
+
+import java.io.*;
+import java.net.*;
+
+public class LAB3_35_39_Client {
+    Socket socket;
+    DataInputStream dis;
+    DataOutputStream dos;
+    BufferedReader reader;
+
+    public LAB3_35_39_Client() {
+        try {
+            socket = new Socket("localhost", 5000);
+            dis = new DataInputStream(socket.getInputStream());
+            dos = new DataOutputStream(socket.getOutputStream());
+            reader = new BufferedReader(new InputStreamReader(System.in));
+            startClient();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    void startClient() {
+        try {
+            while (true) {
+                String serverMessage = dis.readUTF();
+                System.out.println(serverMessage);
+
+                String userInput = reader.readLine();
+                dos.writeUTF(userInput);
+
+                if (userInput.equalsIgnoreCase("EXIT")) {
+                    System.out.println("Session ended.");
+                    break;
+                }
+
+                String response = dis.readUTF();
+                System.out.println(response);
+            }
+
+            dis.close();
+            dos.close();
+            socket.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public static void main(String[] args) {
+        new LAB3_35_39_Client();
+    }
+}
